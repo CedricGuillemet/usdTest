@@ -27,7 +27,7 @@ let updateObserver: any = null;
 
 // 4. Set up drag & drop
 setupDropHandler(canvas, {
-  onFilesDropped: async ({ allFiles, rootFile }) => {
+  onFilesDropped: async ({ allFiles, rootFile, fileEntries }) => {
     if (!usdReady) {
       statusEl.textContent = 'USD runtime still loading, please wait…';
       return;
@@ -53,7 +53,7 @@ setupDropHandler(canvas, {
     }
 
     try {
-      activeUsdScene = await loadUsdFiles(ctx.scene, allFiles, rootFile);
+      activeUsdScene = await loadUsdFiles(ctx.scene, allFiles, rootFile, fileEntries);
 
       // Register update in render loop
       updateObserver = ctx.scene.onBeforeRenderObservable.add(() => {

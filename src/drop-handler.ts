@@ -14,6 +14,8 @@ export interface DropResult {
   allFiles: DroppedFile[];
   /** The auto-detected root USD file */
   rootFile: DroppedFile;
+  /** Raw FileSystemFileEntry objects for URL resolution by the USD runtime */
+  fileEntries: FileSystemFileEntry[];
 }
 
 export interface DropHandlerCallbacks {
@@ -155,23 +157,23 @@ export function setupDropHandler(target: HTMLElement, callbacks: DropHandlerCall
     }
 
     let droppedFiles: DroppedFile[];
+    let collectedEntries: FileSystemFileEntry[] = [];
 
     if (allEntries.length > 0) {
       // Recursively collect files from entries (handles folders)
-      const fileEntries: FileSystemFileEntry[] = [];
       for (const entry of allEntries) {
         if (entry.isFile) {
           if (!FILE_IGNORE.has(entry.name)) {
-            fileEntries.push(entry as FileSystemFileEntry);
+            collectedEntries.push(entry as FileSystemFileEntry);
           }
         } else if (entry.isDirectory) {
           if (!DIR_IGNORE.has(entry.name)) {
             const subFiles = await readDirectoryRecursive(entry as FileSystemDirectoryEntry);
-            fileEntries.push(...subFiles);
+            collectedEntries.push(...subFiles);
           }
         }
       }
-      droppedFiles = await Promise.all(fileEntries.map(entryToDroppedFile));
+      droppedFiles = await Promise.all(collectedEntries.map(entryToDroppedFile));
     } else {
       // Fallback: plain File API (no folder support)
       droppedFiles = [];
@@ -191,7 +193,7 @@ export function setupDropHandler(target: HTMLElement, callbacks: DropHandlerCall
       return;
     }
 
-    callbacks.onFilesDropped({ allFiles: droppedFiles, rootFile });
+    callbacks.onFilesDropped({ allFiles: droppedFiles, rootFile, fileEntries: collectedEntries });
   });
 
   // Prevent default on body to avoid browser opening files
