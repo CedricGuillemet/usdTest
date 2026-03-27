@@ -1,5 +1,5 @@
 import { initBabylon, removeDefaultScene, type BabylonContext } from './babylon-setup';
-import { initUsdModule, loadUsdFile, type UsdSceneHandle } from './usd-loader';
+import { initUsdModule, loadUsdFiles, type UsdSceneHandle } from './usd-loader';
 import { setupDropHandler } from './drop-handler';
 
 const statusEl = document.getElementById('status')!;
@@ -15,7 +15,7 @@ initUsdModule((status) => {
   statusEl.textContent = status || 'Loading USD runtime…';
 }).then(() => {
   usdReady = true;
-  statusEl.textContent = 'Ready — drop a .usd / .usda / .usdz file to load';
+  statusEl.textContent = 'Ready — drop a .usd / .usda / .usdz file or folder to load';
 }).catch((err) => {
   console.error('Failed to initialize USD module:', err);
   statusEl.textContent = 'Failed to load USD runtime';
@@ -23,21 +23,27 @@ initUsdModule((status) => {
 
 // 3. Track active USD scene
 let activeUsdScene: UsdSceneHandle | null = null;
+let updateObserver: any = null;
 
 // 4. Set up drag & drop
 setupDropHandler(canvas, {
-  onFilesDropped: async (fileName, buffer) => {
+  onFilesDropped: async ({ allFiles, rootFile }) => {
     if (!usdReady) {
       statusEl.textContent = 'USD runtime still loading, please wait…';
       return;
     }
 
-    statusEl.textContent = `Loading ${fileName}…`;
+    const fileCount = allFiles.length;
+    statusEl.textContent = `Loading ${rootFile.name} (${fileCount} file${fileCount > 1 ? 's' : ''})…`;
 
     // Dispose previous USD scene
     if (activeUsdScene) {
       activeUsdScene.dispose();
       activeUsdScene = null;
+    }
+    if (updateObserver) {
+      ctx.scene.onBeforeRenderObservable.remove(updateObserver);
+      updateObserver = null;
     }
 
     // Remove default Babylon playground scene
@@ -47,10 +53,10 @@ setupDropHandler(canvas, {
     }
 
     try {
-      activeUsdScene = await loadUsdFile(ctx.scene, fileName, buffer);
+      activeUsdScene = await loadUsdFiles(ctx.scene, allFiles, rootFile);
 
       // Register update in render loop
-      ctx.scene.onBeforeRenderObservable.add(() => {
+      updateObserver = ctx.scene.onBeforeRenderObservable.add(() => {
         const dt = ctx.engine.getDeltaTime() / 1000;
         activeUsdScene?.update(dt);
       });
@@ -58,10 +64,10 @@ setupDropHandler(canvas, {
       // Frame the loaded content
       frameCamera(ctx);
 
-      statusEl.textContent = `Loaded: ${fileName}`;
+      statusEl.textContent = `Loaded: ${rootFile.name} (${fileCount} file${fileCount > 1 ? 's' : ''})`;
     } catch (err) {
       console.error('Failed to load USD file:', err);
-      statusEl.textContent = `Error loading ${fileName}`;
+      statusEl.textContent = `Error loading ${rootFile.name}`;
     }
   },
 });
@@ -70,12 +76,10 @@ setupDropHandler(canvas, {
  * Adjust camera to frame loaded USD content.
  */
 function frameCamera(ctx: BabylonContext) {
-  // Wait a frame for meshes to be committed
   setTimeout(() => {
     const meshes = ctx.scene.meshes.filter(m => m.name !== '__root__');
     if (meshes.length === 0) return;
 
-    // Compute bounding info across all meshes
     let min = meshes[0].getBoundingInfo().boundingBox.minimumWorld.clone();
     let max = meshes[0].getBoundingInfo().boundingBox.maximumWorld.clone();
 

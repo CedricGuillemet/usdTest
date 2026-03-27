@@ -1,11 +1,13 @@
 import { Scene, TransformNode } from '@babylonjs/core';
 import { BabylonRenderDelegate } from './hydra';
+import type { DroppedFile } from './drop-handler';
 
 // Minimal type declarations for the WASM USD module
 interface USDModule {
   FS_createDataFile(parent: string, filepath: string, data: Uint8Array, canRead: boolean, canWrite: boolean, canOwn: boolean): void;
   FS_createPath(parent: string, path: string, canRead: boolean, canWrite: boolean): void;
   FS_unlink(path: string): void;
+  FS_rmdir(path: string): void;
   FS_analyzePath(path: string): any;
   HdWebSyncDriver: new (delegate: any, filepath: string) => HdWebSyncDriver;
   ready: Promise<any>;
@@ -34,7 +36,6 @@ let usdModule: USDModule | null = null;
 export async function initUsdModule(onStatus?: (msg: string) => void): Promise<USDModule> {
   if (usdModule) return usdModule;
 
-  // Dynamic import to access getUsdModule from @needle-tools/usd
   const { getUsdModule } = await import('@needle-tools/usd');
 
   usdModule = await (getUsdModule as any)({
@@ -59,32 +60,71 @@ export interface UsdSceneHandle {
  * Determine file format from ArrayBuffer magic bytes.
  */
 function guessExtension(buffer: ArrayBuffer): string {
-  const arr = new Uint8Array(buffer, 0, 4);
-  // USDZ is a zip archive: PK header
+  const arr = new Uint8Array(buffer, 0, Math.min(buffer.byteLength, 8));
   if (arr[0] === 0x50 && arr[1] === 0x4B) return 'usdz';
-  // USDC (crate): starts with "PXR-USDC"
-  const header = String.fromCharCode(...new Uint8Array(buffer, 0, 8));
+  const header = String.fromCharCode(...arr);
   if (header.startsWith('PXR-USDC')) return 'usdc';
   return 'usd';
 }
 
-export async function loadUsdFile(
+/** Common directory prefix in the WASM virtual FS to avoid clashes */
+const WASM_DIR = 'needle/';
+
+/**
+ * Load a set of files (from a folder drop) into the WASM virtual FS,
+ * then create an HdWebSyncDriver pointing at the root USD file.
+ */
+export async function loadUsdFiles(
   scene: Scene,
-  fileName: string,
-  fileBuffer: ArrayBuffer,
+  allFiles: DroppedFile[],
+  rootFile: DroppedFile,
 ): Promise<UsdSceneHandle> {
   const USD = await initUsdModule();
 
-  // Sanitize filename
-  let sanitized = fileName.replace(/[\\/]/g, '_');
-  const ext = sanitized.split('.').pop()?.toLowerCase() ?? '';
-  const validExts = ['usd', 'usda', 'usdc', 'usdz'];
-  if (!validExts.includes(ext)) {
-    sanitized += '.' + guessExtension(fileBuffer);
+  // Track all paths we write so we can clean up on dispose
+  const createdPaths: string[] = [];
+  const createdDirs = new Set<string>();
+
+  // Write all files into the WASM virtual filesystem
+  for (const df of allFiles) {
+    const parts = df.relativePath.split('/');
+    const fileName = parts.pop()!;
+    const directory = parts.join('/');
+
+    // Ensure parent directories exist
+    if (directory) {
+      // Create each segment of the path
+      const segments = directory.split('/');
+      let currentPath = '';
+      for (const seg of segments) {
+        currentPath += seg + '/';
+        const fullDir = WASM_DIR + currentPath;
+        if (!createdDirs.has(fullDir)) {
+          try {
+            USD.FS_createPath('', fullDir, true, true);
+          } catch { /* may already exist */ }
+          createdDirs.add(fullDir);
+        }
+      }
+    } else if (!createdDirs.has(WASM_DIR)) {
+      try {
+        USD.FS_createPath('', WASM_DIR, true, true);
+      } catch { /* may already exist */ }
+      createdDirs.add(WASM_DIR);
+    }
+
+    const fileDir = WASM_DIR + (directory ? directory + '/' : '');
+    const buffer = await df.file.arrayBuffer();
+    try {
+      USD.FS_createDataFile(fileDir, fileName, new Uint8Array(buffer), true, true, true);
+      createdPaths.push(fileDir + fileName);
+    } catch (e) {
+      console.warn(`[usd-loader] Failed to write ${df.relativePath} to WASM FS:`, e);
+    }
   }
 
-  // Write file to WASM virtual filesystem
-  USD.FS_createDataFile('', sanitized, new Uint8Array(fileBuffer), true, true, true);
+  // Determine the root file path in the virtual FS
+  const rootPath = WASM_DIR + rootFile.relativePath;
 
   // Create USD root transform node
   const usdRoot = new TransformNode('usdRoot', scene);
@@ -92,8 +132,8 @@ export async function loadUsdFile(
   // Create our Babylon render delegate
   const delegate = new BabylonRenderDelegate(scene, usdRoot);
 
-  // Create driver (may return a Promise due to Asyncify)
-  let driverOrPromise: any = new USD.HdWebSyncDriver(delegate as any, sanitized);
+  // Create driver
+  let driverOrPromise: any = new USD.HdWebSyncDriver(delegate as any, rootPath);
   if (driverOrPromise instanceof Promise) driverOrPromise = await driverOrPromise;
   const finalDriver = driverOrPromise as HdWebSyncDriver;
   delegate.setDriverAccessor(() => finalDriver);
@@ -108,7 +148,7 @@ export async function loadUsdFile(
     stage = finalDriver.GetStage() as USDStage;
   }
 
-  // Handle Z-up stages: Babylon is Y-up
+  // Handle Z-up stages
   const upAxis = String.fromCharCode(stage.GetUpAxis());
   if (upAxis === 'z' || upAxis === 'Z') {
     usdRoot.rotation.x = -Math.PI / 2;
@@ -138,9 +178,37 @@ export async function loadUsdFile(
     dispose() {
       finalDriver.delete();
       delegate.dispose();
-      try {
-        USD.FS_unlink(sanitized);
-      } catch { /* file may already be unlinked */ }
+      // Clean up all files from virtual FS
+      for (const path of createdPaths) {
+        try { USD.FS_unlink(path); } catch { /* ignore */ }
+      }
+      // Clean up directories (reverse order so children go first)
+      const dirs = [...createdDirs].sort((a, b) => b.length - a.length);
+      for (const dir of dirs) {
+        try { USD.FS_rmdir(dir); } catch { /* ignore */ }
+      }
     },
   };
+}
+
+/**
+ * Convenience: load a single file (e.g. a .usdz archive).
+ */
+export async function loadUsdFile(
+  scene: Scene,
+  fileName: string,
+  fileBuffer: ArrayBuffer,
+): Promise<UsdSceneHandle> {
+  // Sanitize filename
+  let sanitized = fileName.replace(/[\\/]/g, '_');
+  const ext = sanitized.split('.').pop()?.toLowerCase() ?? '';
+  const validExts = ['usd', 'usda', 'usdc', 'usdz'];
+  if (!validExts.includes(ext)) {
+    sanitized += '.' + guessExtension(fileBuffer);
+  }
+
+  // Wrap as a DroppedFile
+  const file = new File([fileBuffer], sanitized);
+  const droppedFile: DroppedFile = { relativePath: sanitized, name: sanitized, file };
+  return loadUsdFiles(scene, [droppedFile], droppedFile);
 }
